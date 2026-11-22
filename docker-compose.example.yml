@@ -1,0 +1,29 @@
+# Example: the backend plus Caddy for automatic HTTPS (the app only connects over https).
+# 1. Point a domain at this machine and open ports 80 and 443.
+# 2. cp docker-compose.example.yml docker-compose.yml; set FITNESS_DOMAIN and FITNESS_APP_TOKEN in a .env file
+#    next to it (FITNESS_APP_TOKEN: at least 16 characters, e.g. `openssl rand -hex 24`).
+# 3. docker compose up -d
+# In the app: 我的 › 数据存储 › 自己的服务器, address https://<FITNESS_DOMAIN>, token FITNESS_APP_TOKEN.
+services:
+  fitness:
+    build: .
+    restart: unless-stopped
+    environment:
+      FITNESS_APP_TOKEN: ${FITNESS_APP_TOKEN:?set FITNESS_APP_TOKEN in .env}
+      # Optional: a second token for an agent that plans your training through the API (see README).
+      FITNESS_COACH_TOKEN: ${FITNESS_COACH_TOKEN:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - fitness-data:/data
+
+  caddy:
+    image: caddy:2.10.2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    command: caddy reverse-proxy --from ${FITNESS_DOMAIN:?set FITNESS_DOMAIN in .env} --to fitness:8720
+    volumes:
+      - caddy-data:/data
+
+volumes:
+  fitness-data:
+  caddy-data:
