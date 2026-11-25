@@ -1,3 +1,5 @@
+import { effectiveSets, type GroupableItem } from "./groups";
+
 // Session difficulty tier. Mirrors ios/Fitness/Data/PlanDifficulty.swift; change both together.
 // The test pins the 24 preset plans' tiers (ios/Content/plans.json).
 
@@ -5,7 +7,7 @@ export const DIFFICULTIES = ["beginner", "intermediate", "advanced", "expert"] a
 export type Difficulty = (typeof DIFFICULTIES)[number];
 
 type Ex = { mode: "reps" | "time"; unilateral: boolean; tempoSec: number; pauseSec: number; level?: number };
-type Item = { exerciseId: string; section?: string; sets: number; reps?: number; seconds?: number; tempoSec?: number; pauseSec?: number };
+type Item = GroupableItem & { exerciseId: string; section?: string; sets: number; reps?: number; seconds?: number; tempoSec?: number; pauseSec?: number };
 
 /** Upper bounds (exclusive) of the mean level for beginner, intermediate, advanced; anything higher is expert. */
 export const TIER_BOUNDS = [2, 3.3, 4] as const;
@@ -15,13 +17,14 @@ export const TIER_BOUNDS = [2, 3.3, 4] as const;
  * cool-down only count when there is no main section. Exercises without a level are left out. Null if nothing is rated.
  */
 export function meanLevel(items: Item[], getEx: (id: string) => Ex | null): number | null {
-  const main = items.filter((it) => (it.section ?? "main") === "main");
+  const hasMain = items.some((it) => (it.section ?? "main") === "main");
   let w = 0, sum = 0;
-  for (const it of main.length ? main : items) {
+  for (const [i, it] of items.entries()) {
+    if (hasMain && (it.section ?? "main") !== "main") continue;
     const ex = getEx(it.exerciseId);
     if (!ex?.level) continue;
     const per = ex.mode === "reps" ? (it.reps ?? 0) * ((it.tempoSec ?? ex.tempoSec) + (it.pauseSec ?? ex.pauseSec)) : (it.seconds ?? 0);
-    const t = per * it.sets * (ex.unilateral ? 2 : 1);
+    const t = per * effectiveSets(items, i) * (ex.unilateral ? 2 : 1);
     w += t; sum += t * ex.level;
   }
   return w > 0 ? sum / w : null;

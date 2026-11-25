@@ -38,4 +38,14 @@ describe("estimate", () => {
     expect(estimate([{ exerciseId: "nope", sets: 1, reps: 1, restSec: 0, restAfterSec: 0 }], get)).toBeNull();
     expect(estimate([{ exerciseId: "plank", sets: 1, reps: 10, restSec: 0, restAfterSec: 0 }], get)).toBeNull();
   });
+  test("superset / circuit repeats rounds with roundRestSec between rounds and last restAfterSec at end", () => {
+    const e = estimate([
+      { exerciseId: "squat", sets: 1, reps: 10, restSec: 0, restAfterSec: 10, groupId: "g1", rounds: 3, roundRestSec: 45 },
+      { exerciseId: "plank", sets: 1, seconds: 20, restSec: 0, restAfterSec: 60, groupId: "g1" },
+      { exerciseId: "pushup", sets: 1, reps: 10, restSec: 0, restAfterSec: 0 },
+    ], get);
+    // Round work: (10*3 + 20) * 3 = 150, plus pushup 10*3 = 30 -> work = 12 + 180 = 192
+    // Rest: inside rounds 10 * 3 = 30; between rounds 45 * 2 = 90; after group 60 -> rest = 180
+    expect(e).toEqual({ totalSec: 372, workSec: 192, restSec: 180 });
+  });
 });

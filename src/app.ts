@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { estimate } from "./estimate";
+import { effectiveSets } from "./groups";
 import { autoDifficulty } from "./difficulty";
 import { builtinPlans, bundledMedia } from "./builtin";
 import {
@@ -128,8 +129,9 @@ export function createApp(cfg: AppConfig) {
    *  isn't there. */
   const covers = (items: Items,
     sets: { itemIndex: number; exerciseId: string; set: number; status: string; side?: string | null }[]) => {
+    const totals = items.map((_, i) => effectiveSets(items, i));
     // Every row belongs to a planned set: the app has no extra sets, so one beyond the plan isn't the session as planned.
-    if (sets.some((x) => items[x.itemIndex]?.exerciseId !== x.exerciseId || x.status !== "done" || x.set > items[x.itemIndex]!.sets)) {
+    if (sets.some((x) => items[x.itemIndex]?.exerciseId !== x.exerciseId || x.status !== "done" || x.set > (totals[x.itemIndex] ?? 0))) {
       return false;
     }
     return items.every((it, i) => {
@@ -142,7 +144,8 @@ export function createApp(cfg: AppConfig) {
         if (sides.length === 1) return sides[0] === null || !twoSided;
         return twoSided && sides.length === 2 && sides.includes("left") && sides.includes("right");
       };
-      for (let n = 1; n <= it.sets; n++) if (!has(n)) return false;
+      const total = totals[i] ?? it.sets;
+      for (let n = 1; n <= total; n++) if (!has(n)) return false;
       return true;
     });
   };
@@ -173,15 +176,17 @@ export function createApp(cfg: AppConfig) {
     const r = db.query<Row, [string]>("SELECT * FROM sessions WHERE id = ?").get(id);
     return r ? toSession(r) : null;
   };
-  const toPlan = (r: Row & { archived: number }): z.infer<typeof Plan> => {
+  type PlanRow = Row & { archived: number; locked: number; shelved: number };
+  const toPlan = (r: PlanRow): z.infer<typeof Plan> => {
     const data = stored(PlanInput, r.data);
     return {
-      ...data, id: r.id, archived: r.archived === 1, autoDifficulty: autoDifficulty(data.items, getExercise),
+      ...data, id: r.id, archived: r.archived === 1, locked: r.locked === 1, shelved: r.shelved === 1,
+      autoDifficulty: autoDifficulty(data.items, getExercise),
       estimate: estimate(data.items, getExercise), createdAt: r.created_at, updatedAt: r.updated_at, updatedBy: r.updated_by,
     };
   };
   const getPlan = (id: string) => {
-    const r = db.query<Row & { archived: number }, [string]>("SELECT * FROM plans WHERE id = ?").get(id);
+    const r = db.query<PlanRow, [string]>("SELECT * FROM plans WHERE id = ?").get(id);
     return r ? toPlan(r) : null;
   };
   const builtin = () => new Map(builtinPlans().map((p) => [p.id, p]));
@@ -205,10 +210,14 @@ export function createApp(cfg: AppConfig) {
     if (p) return { title: p.title, note: p.note, items: p.items, difficulty: p.difficulty ?? null };
     return getPreset(planId) ?? { title: planId, note: "", items: [], difficulty: null };
   };
-  /** Error message if a session can't be put on this plan: it must exist and not be archived. */
-  const checkPlan = (planId: string): string | null => {
+  /** Error message if a session can't be put on this plan: it must exist, not be archived, and (for coach) not shelved. */
+  const checkPlan = (planId: string, actor: Actor): string | null => {
     const p = getPlan(planId);
-    if (p) return p.archived ? `plan ${planId} was deleted` : null;
+    if (p) {
+      if (p.archived) return `plan ${planId} was deleted`;
+      if (p.shelved && actor === "coach") return `plan ${planId} is shelved; unshelve it or pick an active plan`;
+      return null;
+    }
     return getPreset(planId) ? null : `unknown planId ${planId}`;
   };
   const getWorkout = (id: string) => {
@@ -417,9 +426,10 @@ export function createApp(cfg: AppConfig) {
       const input = c.req.valid("json");
       const badDate = checkDate(input.date);
       if (badDate) return c.json({ error: "invalid_date", details: badDate }, 400);
-      const badPlan = checkPlan(input.planId);
+      const actor = c.get("actor");
+      const badPlan = checkPlan(input.planId, actor);
       if (badPlan) return c.json({ error: "invalid_plan", details: badPlan }, 400);
-      const id = crypto.randomUUID(), t = now(), actor = c.get("actor");
+      const id = crypto.randomUUID(), t = now();
       db.transaction(() => {
         db.query("INSERT INTO sessions (id, date, data, created_at, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?)")
           .run(id, input.date, JSON.stringify(input), t, t, actor);
@@ -460,9 +470,9 @@ export function createApp(cfg: AppConfig) {
       const badDate = checkDate(input.date, before.date);
       if (badDate) return c.json({ error: "invalid_date", details: badDate }, 400);
       // A new day schedules the plan again, so a deleted (archived) plan can't move either; it may stay where it is.
-      const badPlan = input.planId === before.planId && input.date === before.date ? null : checkPlan(input.planId);
-      if (badPlan) return c.json({ error: "invalid_plan", details: badPlan }, 400);
       const actor = c.get("actor");
+      const badPlan = input.planId === before.planId && input.date === before.date ? null : checkPlan(input.planId, actor);
+      if (badPlan) return c.json({ error: "invalid_plan", details: badPlan }, 400);
       db.transaction(() => {
         db.query("UPDATE sessions SET date = ?, data = ?, updated_at = ?, updated_by = ? WHERE id = ?")
           .run(input.date, JSON.stringify(input), now(), actor, id);
@@ -498,7 +508,7 @@ export function createApp(cfg: AppConfig) {
       method: "get", path: "/v1/plans", tags: ["plans"], security, summary: "List the user's plans (我的计划), archived ones too (flagged)",
       responses: { 200: json(z.array(Plan), "Plans") },
     }),
-    (c) => c.json(db.query<Row & { archived: number }, []>("SELECT * FROM plans ORDER BY created_at").all().map(toPlan), 200),
+    (c) => c.json(db.query<PlanRow, []>("SELECT * FROM plans ORDER BY created_at").all().map(toPlan), 200),
   );
 
   app.openapi(
@@ -526,7 +536,7 @@ export function createApp(cfg: AppConfig) {
       method: "put", path: "/v1/plans/{id}", tags: ["plans"], security,
       summary: "Replace a plan. Every session that uses it changes with it (its trained ones keep their workout records)",
       request: { params: IdParam, body: json(PlanInput, "Plan") },
-      responses: { 200: json(Plan, "Updated"), 400: err("Invalid"), 404: err("Not found"), 409: err("Archived") },
+      responses: { 200: json(Plan, "Updated"), 400: err("Invalid"), 404: err("Not found"), 409: err("Archived or locked") },
     }),
     (c) => {
       const { id } = c.req.valid("param");
@@ -534,6 +544,12 @@ export function createApp(cfg: AppConfig) {
       const before = getPlan(id);
       if (!before) return c.json({ error: "not_found" }, 404);
       if (before.archived) return c.json({ error: "plan_archived", details: "this plan was deleted; create a new one" }, 409);
+      if (before.locked) {
+        return c.json({
+          error: "plan_locked",
+          details: "this plan is locked; copy it into a new plan (POST /v1/plans) or unlock it in the app first",
+        }, 409);
+      }
       const problem = checkItems(input, before);
       if (problem) return c.json({ error: "invalid_items", details: problem }, 400);
       const actor = c.get("actor");
@@ -552,12 +568,19 @@ export function createApp(cfg: AppConfig) {
       method: "delete", path: "/v1/plans/{id}", tags: ["plans"], security,
       summary: "Delete a plan with its sessions from today on that aren't trained. If sessions still point at it (trained or past ones) it is archived instead: hidden from 我的计划, kept for them",
       request: { params: IdParam },
-      responses: { 200: json(z.object({ archived: z.boolean(), deletedSessions: z.array(z.string()) }), "Deleted (or archived)"), 404: err("Not found") },
+      responses: {
+        200: json(z.object({ archived: z.boolean(), deletedSessions: z.array(z.string()) }), "Deleted (or archived)"),
+        404: err("Not found"),
+        409: err("Locked"),
+      },
     }),
     (c) => {
       const { id } = c.req.valid("param");
       const before = getPlan(id);
       if (!before || before.archived) return c.json({ error: "not_found" }, 404);
+      if (before.locked) {
+        return c.json({ error: "plan_locked", details: "this plan is locked; unlock it in the app first" }, 409);
+      }
       const actor = c.get("actor"), today = dayAt(clock(), 8);
       const rows = db.query<Row, [string]>("SELECT * FROM sessions WHERE json_extract(data, '$.planId') = ?").all(id);
       const doomed = rows.map(toSession).filter((s) => s.date >= today && s.workoutIds.length === 0);
@@ -578,6 +601,58 @@ export function createApp(cfg: AppConfig) {
       return c.json({ archived, deletedSessions: doomed.map((s) => s.id) }, 200);
     },
   );
+
+  for (const [path, locked, action] of [["lock", 1, "lock"], ["unlock", 0, "unlock"]] as const) {
+    app.openapi(
+      createRoute({
+        method: "post", path: `/v1/plans/{id}/${path}`, tags: ["plans"], security,
+        summary: locked ? "Lock plan (read-only master template; app only)" : "Unlock plan (app only)",
+        request: { params: IdParam },
+        responses: { 200: json(Plan, "Updated"), 403: err("App only"), 404: err("Not found"), 409: err("Archived") },
+      }),
+      (c) => {
+        const actor = c.get("actor");
+        if (actor !== "app") {
+          return c.json({ error: "app_only", details: "only the user in the app can lock or unlock a plan" }, 403);
+        }
+        const { id } = c.req.valid("param");
+        const before = getPlan(id);
+        if (!before) return c.json({ error: "not_found" }, 404);
+        if (before.archived) return c.json({ error: "plan_archived", details: "this plan was deleted" }, 409);
+        db.transaction(() => {
+          db.query("UPDATE plans SET locked = ?, updated_by = ? WHERE id = ?").run(locked, actor, id);
+          logChange(actor, "plan", id, action, null, null);
+        })();
+        return c.json(getPlan(id)!, 200);
+      },
+    );
+  }
+
+  for (const [path, shelved, action] of [["shelve", 1, "shelve"], ["unshelve", 0, "unshelve"]] as const) {
+    app.openapi(
+      createRoute({
+        method: "post", path: `/v1/plans/{id}/${path}`, tags: ["plans"], security,
+        summary: shelved ? "Shelve plan into 已收起 (reversible archive)" : "Restore shelved plan to 我的计划",
+        request: { params: IdParam },
+        responses: { 200: json(Plan, "Updated"), 404: err("Not found"), 409: err("Archived or locked") },
+      }),
+      (c) => {
+        const actor = c.get("actor");
+        const { id } = c.req.valid("param");
+        const before = getPlan(id);
+        if (!before) return c.json({ error: "not_found" }, 404);
+        if (before.archived) return c.json({ error: "plan_archived", details: "this plan was deleted" }, 409);
+        if (before.locked && actor === "coach") {
+          return c.json({ error: "plan_locked", details: "this plan is locked and cannot be shelved or unshelved by the coach" }, 409);
+        }
+        db.transaction(() => {
+          db.query("UPDATE plans SET shelved = ?, updated_by = ? WHERE id = ?").run(shelved, actor, id);
+          logChange(actor, "plan", id, action, null, null);
+        })();
+        return c.json(getPlan(id)!, 200);
+      },
+    );
+  }
 
   // ---- presets (built-in plans synced from the app on demand; separate from 我的计划) ----
   app.openapi(

@@ -1,5 +1,6 @@
 import { z } from "@hono/zod-openapi";
 import { DIFFICULTIES } from "./difficulty";
+import { validateGroups } from "./groups";
 
 export const Actor = z.enum(["app", "coach"]);
 export type Actor = z.infer<typeof Actor>;
@@ -92,7 +93,10 @@ export const SessionItem = z
     pauseSec: z.number().min(0).max(30).optional().openapi({ description: "Override exercise default" }),
     weightKg: z.number().min(0).max(500).multipleOf(0.25).optional().openapi({ description: "External load per set in kg (dumbbell, vest). Omit for bodyweight" }),
     restSec: z.number().int().min(0).max(600).openapi({ description: "Rest between sets of this item" }),
-    restAfterSec: z.number().int().min(0).max(900).openapi({ description: "Rest after the last set, before the next item" }),
+    restAfterSec: z.number().int().min(0).max(900).openapi({ description: "Rest after the last set, before the next item (or next exercise inside a group)" }),
+    groupId: z.string().trim().min(1).max(40).optional().openapi({ description: "Consecutive items sharing the same groupId form a superset (2 items) or circuit (3+ items)" }),
+    rounds: z.number().int().min(2).max(20).optional().openapi({ description: "Total rounds for the group (required on the first item of a group, 2-20)" }),
+    roundRestSec: z.number().int().min(0).max(900).optional().openapi({ description: "Rest between rounds of the group (on the first item, default 0)" }),
   })
   .openapi("SessionItem");
 
@@ -137,15 +141,22 @@ export const PlanInput = z
   .object({
     title: z.string().trim().min(1).max(60),
     note: z.string().max(500).default(""),
-    items: z.array(SessionItem).min(1).max(30),
+    items: z.array(SessionItem).min(1).max(50),
     difficulty: Difficulty.nullable().optional()
       .openapi({ description: "Difficulty label set by hand; null or absent = the app shows autoDifficulty" }),
+  })
+  .superRefine((plan, ctx) => {
+    for (const err of validateGroups(plan.items)) {
+      ctx.addIssue({ code: "custom", path: ["items", err.index], message: err.message });
+    }
   })
   .openapi("PlanInput");
 
 export const Plan = PlanInput.extend({
   id: z.string(),
   archived: z.boolean().openapi({ description: "Deleted while sessions still pointed at it (trained or past ones): hidden from 我的计划 and can't be scheduled or changed, kept so those sessions still resolve" }),
+  locked: z.boolean().openapi({ description: "Read-only master template locked by the user: cannot be modified, deleted, or shelved by the coach; unlock in the app first or copy into a new plan" }),
+  shelved: z.boolean().openapi({ description: "Reversibly tucked into 已收起: hidden from the active list and default coach reads; cannot be scheduled by the coach until unshelved" }),
   autoDifficulty: Difficulty.nullable().openapi({ description: "Read-only, same rule as Session.autoDifficulty" }),
   estimate: Session.shape.estimate,
   createdAt: z.string(),
@@ -178,8 +189,8 @@ export const WorkoutInput = z
     status: z.enum(["completed", "ended_early"]),
     sets: z
       .array(WorkoutSet)
-      // The largest valid session: 30 items x 20 sets x 2 sides (one-sided moves log left and right apart).
-      .max(1200)
+      // Enough for 50 items x 20 sets/rounds x 2 sides (with a generous headroom for grouped circuits).
+      .max(5000)
       .refine(
         (ss) => new Set(ss.map((x) => `${x.itemIndex}/${x.set}/${x.side}`)).size === ss.length,
         "duplicate (itemIndex, set, side)",
@@ -190,7 +201,7 @@ export const WorkoutInput = z
       .openapi({ description: "Whole-workout effort, Apple Workout scale: 1-3 easy, 4-6 moderate, 7-8 hard, 9-10 all out. null = not rated. This is what the app records" }),
     efforts: z
       .array(z.object({ itemIndex: z.number().int().min(0), effort: z.number().int().min(1).max(10) }))
-      .max(30)
+      .max(50)
       .refine((es) => new Set(es.map((e) => e.itemIndex)).size === es.length, "one effort per itemIndex")
       .default([])
       .openapi({ description: "Legacy per-exercise effort (same scale). The app no longer sends it; prefer `effort`" }),
@@ -205,7 +216,7 @@ export const WorkoutInput = z
       .openapi({ description: "The plan's title when it was trained, so the record keeps its name if the plan changes or the session is deleted" }),
     pausedSec: z.number().int().min(0).default(0)
       .openapi({ description: "Seconds paused between startedAt and endedAt. Training time = endedAt - startedAt - pausedSec" }),
-    planned: z.array(SessionItem).max(30).optional()
+    planned: z.array(SessionItem).max(50).optional()
       .openapi({ description: "Upload only, not stored: the plan's items as they were when training started, so a plan edited mid-workout doesn't change whether this record covered it. Absent = the session's plan as it is now" }),
   })
   .refine((w) => w.pausedSec * 1000 <= Date.parse(w.endedAt) - Date.parse(w.startedAt) + 1000, {
@@ -229,7 +240,7 @@ export const Change = z
     actor: Actor,
     entity: z.enum(["exercise", "session", "workout", "plan"]),
     entityId: z.string(),
-    action: z.enum(["create", "update", "delete", "archive", "unarchive"]),
+    action: z.enum(["create", "update", "delete", "archive", "unarchive", "lock", "unlock", "shelve", "unshelve"]),
     before: z.unknown().nullable(),
     after: z.unknown().nullable(),
   })

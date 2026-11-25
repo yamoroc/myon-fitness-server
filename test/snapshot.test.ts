@@ -14,7 +14,7 @@ test("one snapshot per day, readable, pruned to keep", () => {
   expect(p).toEndWith("fitness-20261118.db");
   expect(snapshotIfDue(db, snaps, new Date(2026, 10, 18, 5, 0))).toBeNull();
   const copy = new Database(p!, { readonly: true });
-  expect(copy.query("SELECT count(*) AS n FROM schema_migrations").get()).toEqual({ n: 6 });
+  expect(copy.query("SELECT count(*) AS n FROM schema_migrations").get()).toEqual({ n: 7 });
   for (let d = 19; d <= 22; d++) snapshotIfDue(db, snaps, new Date(2026, 10, d, 4, 0), 3);
   expect(readdirSync(snaps).sort()).toEqual(["fitness-20261120.db", "fitness-20261121.db", "fitness-20261122.db"]);
 });

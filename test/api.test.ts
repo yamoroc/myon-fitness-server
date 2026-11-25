@@ -320,6 +320,64 @@ describe("plans", () => {
     expect((await call("POST", "/v1/plans", { title: "x", items: [] })).status).toBe(400);
     expect((await call("POST", "/v1/plans", { title: "x", items: [{ exerciseId: "nope", sets: 1, reps: 1, restSec: 0, restAfterSec: 0 }] })).status).toBe(400);
   });
+
+  test("lock is app-only and hard-blocks edit, delete, and coach shelve while still schedulable", async () => {
+    const { s } = await seed();
+    const input = { title: "标准全身", items: [{ exerciseId: s.id, sets: 3, reps: 10, restSec: 60, restAfterSec: 60 }] };
+    const p = (await call("POST", "/v1/plans", input)).body;
+    expect(p.locked).toBe(false);
+    expect(p.shelved).toBe(false);
+
+    // Coach cannot lock or unlock.
+    expect((await call("POST", `/v1/plans/${p.id}/lock`, undefined, COACH)).status).toBe(403);
+    const locked = await call("POST", `/v1/plans/${p.id}/lock`);
+    expect(locked.status).toBe(200);
+    expect(locked.body.locked).toBe(true);
+    expect(locked.body.updatedAt).toBe(p.updatedAt); // lock doesn't bump content updatedAt
+    expect((await call("POST", `/v1/plans/${p.id}/unlock`, undefined, COACH)).status).toBe(403);
+
+    // Hard lock blocks PUT and DELETE for both app and coach.
+    expect((await call("PUT", `/v1/plans/${p.id}`, { ...input, title: "改名" })).status).toBe(409);
+    expect((await call("PUT", `/v1/plans/${p.id}`, { ...input, title: "改名" }, COACH)).body.error).toBe("plan_locked");
+    expect((await call("DELETE", `/v1/plans/${p.id}`)).body.error).toBe("plan_locked");
+    expect((await call("DELETE", `/v1/plans/${p.id}`, undefined, COACH)).body.error).toBe("plan_locked");
+
+    // Coach cannot shelve a locked plan; app can.
+    expect((await call("POST", `/v1/plans/${p.id}/shelve`, undefined, COACH)).body.error).toBe("plan_locked");
+    expect((await call("POST", `/v1/plans/${p.id}/shelve`)).body.shelved).toBe(true);
+    expect((await call("POST", `/v1/plans/${p.id}/unshelve`)).body.shelved).toBe(false);
+
+    // Locked plans are still schedulable by both app and coach.
+    expect((await call("POST", "/v1/sessions", { date: "2026-11-20", planId: p.id }, COACH)).status).toBe(201);
+
+    // Unlock restores edit & delete.
+    expect((await call("POST", `/v1/plans/${p.id}/unlock`)).body.locked).toBe(false);
+    expect((await call("PUT", `/v1/plans/${p.id}`, { ...input, title: "新版" })).status).toBe(200);
+  });
+
+  test("shelve is reversible; coach can shelve unlocked plans and cannot schedule shelved ones", async () => {
+    const { s } = await seed();
+    const input = { title: "旧计划", items: [{ exerciseId: s.id, sets: 2, reps: 10, restSec: 60, restAfterSec: 60 }] };
+    const p = (await call("POST", "/v1/plans", input)).body;
+
+    // Coach shelves unlocked plan.
+    const sh = await call("POST", `/v1/plans/${p.id}/shelve`, undefined, COACH);
+    expect(sh.status).toBe(200);
+    expect(sh.body.shelved).toBe(true);
+    expect((await call("GET", "/v1/plans")).body[0].shelved).toBe(true);
+
+    // Coach cannot schedule a shelved plan; app still can.
+    expect((await call("POST", "/v1/sessions", { date: "2026-11-20", planId: p.id }, COACH)).body.error).toBe("invalid_plan");
+    expect((await call("POST", "/v1/sessions", { date: "2026-11-20", planId: p.id })).status).toBe(201);
+
+    // Unshelve lets coach schedule again.
+    expect((await call("POST", `/v1/plans/${p.id}/unshelve`, undefined, COACH)).body.shelved).toBe(false);
+    expect((await call("POST", "/v1/sessions", { date: "2026-11-21", planId: p.id }, COACH)).status).toBe(201);
+
+    // Change log captured shelve/unshelve.
+    const actions = (await call("GET", "/v1/changes?since=0")).body.filter((x: { entity: string }) => x.entity === "plan").map((x: { action: string }) => x.action);
+    expect(actions).toEqual(["create", "shelve", "unshelve"]);
+  });
 });
 
 describe("stored rows", () => {
@@ -677,13 +735,14 @@ describe("workouts", () => {
     expect((await call("PUT", "/v1/sessions/past", { ...input, date: "2026-12-30" })).status).toBe(400);
   });
 
-  test("the largest valid session's sets fit: 30 items x 20 sets x 2 sides", async () => {
+  test("the largest valid session's sets fit: 50 items x 20 sets x 2 sides", async () => {
     const base = w(crypto.randomUUID()).sets[0]!;
     const sets = [];
-    for (let i = 0; i < 30; i++) for (let n = 1; n <= 20; n++) for (const side of ["left", "right"])
+    for (let i = 0; i < 50; i++) for (let n = 1; n <= 20; n++) for (const side of ["left", "right"])
       sets.push({ ...base, itemIndex: i, set: n, side });
     expect((await call("POST", "/v1/workouts", { ...w(crypto.randomUUID()), sets })).status).toBe(201);
-    expect((await call("POST", "/v1/workouts", { ...w(crypto.randomUUID()), sets: [...sets, { ...base, itemIndex: 30 }] })).status).toBe(400);
+    const tooMany = Array.from({ length: 5001 }, (_, idx) => ({ ...base, itemIndex: idx, set: 1, side: null }));
+    expect((await call("POST", "/v1/workouts", { ...w(crypto.randomUUID()), sets: tooMany })).status).toBe(400);
   });
 
   test("rejects non-uuid id and bad timestamps", async () => {
@@ -717,6 +776,84 @@ describe("session estimate", () => {
     expect(created.body.estimate).toEqual(want);
     expect((await call("GET", `/v1/sessions/${created.body.id}`)).body.estimate).toEqual(want);
     expect((await call("GET", "/v1/sessions?from=2026-11-19&to=2026-11-19")).body[0].estimate).toEqual(want);
+  });
+});
+
+describe("grouped circuits and 50-item limit", () => {
+  test("accepts up to 50 items and rejects 51", async () => {
+    const { s } = await seed();
+    const item = { exerciseId: s.id, sets: 1, reps: 10, restSec: 30, restAfterSec: 30 };
+    expect((await call("POST", "/v1/plans", { title: "50", items: Array(50).fill(item) })).status).toBe(201);
+    expect((await call("POST", "/v1/plans", { title: "51", items: Array(51).fill(item) })).status).toBe(400);
+  });
+
+  test("validates group continuity, count, section and rounds", async () => {
+    const { s, p } = await seed();
+    const a = { exerciseId: s.id, section: "main", sets: 1, reps: 10, restSec: 0, restAfterSec: 10 };
+    const b = { exerciseId: p.id, section: "main", sets: 1, seconds: 20, restSec: 0, restAfterSec: 30 };
+    // Valid superset
+    expect((await call("POST", "/v1/plans", {
+      title: "superset",
+      items: [{ ...a, groupId: "g1", rounds: 3, roundRestSec: 45 }, { ...b, groupId: "g1" }],
+    })).status).toBe(201);
+    // Single item with groupId
+    expect((await call("POST", "/v1/plans", {
+      title: "bad1", items: [{ ...a, groupId: "g1", rounds: 3 }],
+    })).status).toBe(400);
+    // Non-contiguous groupId
+    expect((await call("POST", "/v1/plans", {
+      title: "bad2", items: [{ ...a, groupId: "g1", rounds: 3 }, b, { ...a, groupId: "g1" }],
+    })).status).toBe(400);
+    // Mixed sections in group
+    expect((await call("POST", "/v1/plans", {
+      title: "bad3", items: [{ ...a, groupId: "g1", rounds: 3 }, { ...b, section: "cooldown", groupId: "g1" }],
+    })).status).toBe(400);
+    // Missing rounds on first item
+    expect((await call("POST", "/v1/plans", {
+      title: "bad4", items: [{ ...a, groupId: "g1" }, { ...b, groupId: "g1" }],
+    })).status).toBe(400);
+    // rounds without groupId
+    expect((await call("POST", "/v1/plans", {
+      title: "bad5", items: [{ ...a, rounds: 3 }],
+    })).status).toBe(400);
+    // rounds on non-first item of group
+    expect((await call("POST", "/v1/plans", {
+      title: "bad6", items: [{ ...a, groupId: "g1", rounds: 3 }, { ...b, groupId: "g1", rounds: 3 }],
+    })).status).toBe(400);
+  });
+
+  test("a grouped session requires all rounds to complete", async () => {
+    const { s, p } = await seed();
+    const sess = (await sched({
+      date: "2026-11-19", title: "circuit",
+      items: [
+        { exerciseId: s.id, sets: 1, reps: 10, restSec: 0, restAfterSec: 10, groupId: "g1", rounds: 2, roundRestSec: 45 },
+        { exerciseId: p.id, sets: 1, seconds: 20, restSec: 0, restAfterSec: 0, groupId: "g1" },
+      ],
+    })).body;
+    const baseSet = {
+      itemIndex: 0, exerciseId: s.id, set: 1, side: null,
+      plannedReps: 10, plannedSeconds: null, actualReps: 10, actualSeconds: null, status: "done",
+    };
+    const workout = (sets: unknown[]) => ({
+      id: crypto.randomUUID(), sessionId: sess.id, date: "2026-11-19",
+      startedAt: "2026-11-19T10:00:00Z", endedAt: "2026-11-19T10:15:00Z",
+      status: "completed", sets,
+    });
+    // Only round 1 done -> ended_early
+    const part = (await call("POST", "/v1/workouts", workout([
+      { ...baseSet, itemIndex: 0, exerciseId: s.id, set: 1 },
+      { ...baseSet, itemIndex: 1, exerciseId: p.id, set: 1, plannedReps: null, plannedSeconds: 20, actualReps: null, actualSeconds: 20 },
+    ]))).body;
+    expect(part.status).toBe("ended_early");
+    // Both rounds done -> completed
+    const full = (await call("POST", "/v1/workouts", workout([
+      { ...baseSet, itemIndex: 0, exerciseId: s.id, set: 1 },
+      { ...baseSet, itemIndex: 1, exerciseId: p.id, set: 1, plannedReps: null, plannedSeconds: 20, actualReps: null, actualSeconds: 20 },
+      { ...baseSet, itemIndex: 0, exerciseId: s.id, set: 2 },
+      { ...baseSet, itemIndex: 1, exerciseId: p.id, set: 2, plannedReps: null, plannedSeconds: 20, actualReps: null, actualSeconds: 20 },
+    ]))).body;
+    expect(full.status).toBe("completed");
   });
 });
 
