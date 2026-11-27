@@ -12,7 +12,7 @@ describe("difficulty", () => {
       ["beginner", "beginner", "intermediate", "intermediate", "advanced", "advanced", "expert", "expert"]);
   });
   test.skipIf(plans.length === 0)("every preset plan's label matches the computed tier", () => {
-    expect(plans.length).toBe(51);
+    expect(plans.length).toBe(53);
     for (const p of plans) expect([p.title, autoDifficulty(p.items, get)]).toEqual([p.title, p.difficulty]);
   });
   test("main section only, weighted by time with both sides; unrated left out", () => {

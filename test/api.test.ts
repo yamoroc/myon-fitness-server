@@ -772,7 +772,7 @@ describe("session estimate", () => {
       { exerciseId: s.id, sets: 2, reps: 10, restSec: 60, restAfterSec: 90 },
       { exerciseId: p.id, sets: 1, seconds: 30, restSec: 60, restAfterSec: 0 },
     ] }, COACH);
-    const want = { totalSec: 12 + 60 + 60 + 90 + 30, workSec: 12 + 60 + 30, restSec: 150 };
+    const want = { totalSec: 4 + 60 + 60 + 90 + 30, workSec: 4 + 60 + 30, restSec: 150 };
     expect(created.body.estimate).toEqual(want);
     expect((await call("GET", `/v1/sessions/${created.body.id}`)).body.estimate).toEqual(want);
     expect((await call("GET", "/v1/sessions?from=2026-11-19&to=2026-11-19")).body[0].estimate).toEqual(want);
@@ -854,6 +854,58 @@ describe("grouped circuits and 50-item limit", () => {
       { ...baseSet, itemIndex: 1, exerciseId: p.id, set: 2, plannedReps: null, plannedSeconds: 20, actualReps: null, actualSeconds: 20 },
     ]))).body;
     expect(full.status).toBe("completed");
+  });
+});
+
+describe("plan duration guardrails", () => {
+  test("coach writes reject mismatched duration copy in title/note, app writes are not blocked", async () => {
+    const { s, p } = await seed();
+    // 4 + 2*(10*3) + 60 + 90 + 30 = 244s -> 4 min
+    const items = [
+      { exerciseId: s.id, sets: 2, reps: 10, restSec: 60, restAfterSec: 90 },
+      { exerciseId: p.id, sets: 1, seconds: 30, restSec: 60, restAfterSec: 0 },
+    ];
+    // Coach with mismatched title -> 400 duration_mismatch with actual estimate
+    const bad = await call("POST", "/v1/plans", { title: "15 分钟核心", items }, COACH);
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toBe("duration_mismatch");
+    expect(bad.body.details.actualMinutes).toBe(4);
+    expect(bad.body.details.topItems).toHaveLength(2);
+
+    // Same payload from app token -> allowed (don't block user manual edits)
+    const byApp = await call("POST", "/v1/plans", { title: "15 分钟核心", items });
+    expect(byApp.status).toBe(201);
+
+    // Coach with clean title & nuanced note (even mentioning a different branch duration) -> allowed (only title hard-blocks)
+    const ok = await call("POST", "/v1/plans", { title: "下肢核心", note: "组间休息 1 分钟，30 秒平板", items }, COACH);
+    expect(ok.status).toBe(201);
+    const okNote = await call("PUT", `/v1/plans/${ok.body.id}`, { title: "下肢核心", note: "加做一轮约 20 分钟", items }, COACH);
+    expect(okNote.status).toBe(200);
+
+    // Coach PUT with mismatched title -> 400
+    const badPut = await call("PUT", `/v1/plans/${ok.body.id}`, { title: "二十分钟核心", note: "", items }, COACH);
+    expect(badPut.status).toBe(400);
+    expect(badPut.body.error).toBe("duration_mismatch");
+  });
+
+  test("optional targetMinutes query rejects large duration drift and accepts within tolerance", async () => {
+    const { s, p } = await seed();
+    // 4 + 2*(10*3) + 60 + 90 + 30 = 244s -> 4 min
+    const items = [
+      { exerciseId: s.id, sets: 2, reps: 10, restSec: 60, restAfterSec: 90 },
+      { exerciseId: p.id, sets: 1, seconds: 30, restSec: 60, restAfterSec: 0 },
+    ];
+    const miss = await call("POST", "/v1/plans?targetMinutes=15", { title: "腿部", items }, COACH);
+    expect(miss.status).toBe(400);
+    expect(miss.body.error).toBe("duration_mismatch");
+    expect(miss.body.details.targetMinutes).toBe(15);
+    expect(miss.body.details.actualMinutes).toBe(4);
+    expect(miss.body.details.workMinutes).toBeGreaterThan(0);
+    expect(miss.body.details.restMinutes).toBeGreaterThan(0);
+
+    // Target 6 min -> tolerance max(3, round(1.2)) = 3 -> 4 min is within [3, 9]
+    const hit = await call("POST", "/v1/plans?targetMinutes=6", { title: "腿部", items }, COACH);
+    expect(hit.status).toBe(201);
   });
 });
 

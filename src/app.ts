@@ -3,7 +3,7 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { estimate } from "./estimate";
+import { checkDurationCopy, checkTargetMinutes, estimate, estimateMinutes, topDurationItems } from "./estimate";
 import { effectiveSets } from "./groups";
 import { autoDifficulty } from "./difficulty";
 import { builtinPlans, bundledMedia } from "./builtin";
@@ -503,6 +503,35 @@ export function createApp(cfg: AppConfig) {
   );
 
   // ---- plans (the user's own: content without a date; sessions point at one) ----
+  const PlanDurationQuery = z.object({
+    targetMinutes: z.coerce.number().int().min(1).max(240).optional().openapi({
+      description: "Optional target duration in minutes; rejects with 400 duration_mismatch when actual duration drifts beyond max(3, round(20%))",
+    }),
+  });
+  const checkPlanDuration = (input: z.infer<typeof PlanInput>, actor: Actor, targetMinutes?: number) => {
+    const est = estimate(input.items, getExercise);
+    if (!est) return null;
+    const actualMinutes = estimateMinutes(est);
+    const problems: string[] = [];
+    // Only hard-block conflicting durations in title (notes may discuss rest/branch lengths).
+    if (actor === "coach") problems.push(...checkDurationCopy(input.title, "", actualMinutes));
+    if (targetMinutes != null) {
+      const targetErr = checkTargetMinutes(actualMinutes, targetMinutes);
+      if (targetErr) problems.push(targetErr);
+    }
+    if (problems.length === 0) return null;
+    return {
+      problems,
+      actualMinutes,
+      workMinutes: Math.round((est.workSec / 60) * 10) / 10,
+      restMinutes: Math.round((est.restSec / 60) * 10) / 10,
+      ...(targetMinutes != null ? { targetMinutes } : {}),
+      topItems: topDurationItems(input.items, getExercise, 3),
+      estimate: est,
+      hint: "Remove minute counts from title (the app shows duration automatically) or adjust sets/reps/rest to match.",
+    };
+  };
+
   app.openapi(
     createRoute({
       method: "get", path: "/v1/plans", tags: ["plans"], security, summary: "List the user's plans (我的计划), archived ones too (flagged)",
@@ -514,14 +543,17 @@ export function createApp(cfg: AppConfig) {
   app.openapi(
     createRoute({
       method: "post", path: "/v1/plans", tags: ["plans"], security, summary: "Create a plan",
-      request: { body: json(PlanInput, "Plan") },
+      request: { query: PlanDurationQuery, body: json(PlanInput, "Plan") },
       responses: { 201: json(Plan, "Created"), 400: err("Invalid") },
     }),
     (c) => {
       const input = c.req.valid("json");
+      const { targetMinutes } = c.req.valid("query");
       const problem = checkItems(input);
       if (problem) return c.json({ error: "invalid_items", details: problem }, 400);
       const id = crypto.randomUUID(), t = now(), actor = c.get("actor");
+      const durationProblem = checkPlanDuration(input, actor, targetMinutes);
+      if (durationProblem) return c.json({ error: "duration_mismatch", details: durationProblem }, 400);
       db.transaction(() => {
         db.query("INSERT INTO plans (id, data, created_at, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)")
           .run(id, JSON.stringify(input), t, t, actor);
@@ -535,11 +567,12 @@ export function createApp(cfg: AppConfig) {
     createRoute({
       method: "put", path: "/v1/plans/{id}", tags: ["plans"], security,
       summary: "Replace a plan. Every session that uses it changes with it (its trained ones keep their workout records)",
-      request: { params: IdParam, body: json(PlanInput, "Plan") },
+      request: { params: IdParam, query: PlanDurationQuery, body: json(PlanInput, "Plan") },
       responses: { 200: json(Plan, "Updated"), 400: err("Invalid"), 404: err("Not found"), 409: err("Archived or locked") },
     }),
     (c) => {
       const { id } = c.req.valid("param");
+      const { targetMinutes } = c.req.valid("query");
       const input = c.req.valid("json");
       const before = getPlan(id);
       if (!before) return c.json({ error: "not_found" }, 404);
@@ -553,6 +586,8 @@ export function createApp(cfg: AppConfig) {
       const problem = checkItems(input, before);
       if (problem) return c.json({ error: "invalid_items", details: problem }, 400);
       const actor = c.get("actor");
+      const durationProblem = checkPlanDuration(input, actor, targetMinutes);
+      if (durationProblem) return c.json({ error: "duration_mismatch", details: durationProblem }, 400);
       db.transaction(() => {
         db.query("UPDATE plans SET data = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(JSON.stringify(input), now(), actor, id);
         // Their content changed: bump them so updatedSince pulls see it.
